@@ -1,0 +1,180 @@
+rules_version = '2';
+
+// UniEvent Firestore Security Rules
+// Role-based access: the user's role lives in users/{uid}.role and is read
+// server-side via get(). Roles: student | organiser | vendor | student_affairs.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ───────────── helpers ─────────────
+    function signedIn() { return request.auth != null; }
+    function uid() { return request.auth.uid; }
+    function userDoc() { return get(/databases/$(database)/documents/users/$(uid())); }
+    function role() { return signedIn() ? userDoc().data.role : null; }
+    function isStudent() { return role() == 'student'; }
+    function isOrganiser() { return role() == 'organiser' || role() == 'student_affairs'; }
+    function isVendor() { return role() == 'vendor'; }
+    function isStudentAffairs() { return role() == 'student_affairs'; }
+    function eventDoc(eventId) { return get(/databases/$(database)/documents/events/$(eventId)); }
+    function ownsEvent(eventId) { return eventDoc(eventId).data.organiserId == uid(); }
+    function onlyChanged(fields) {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(fields);
+    }
+
+    // ───────────── users ─────────────
+    match /users/{userId} {
+      // Any signed-in user may read basic profiles (names on tickets, organiser lists).
+      allow read: if signedIn();
+      // Create own profile; role must be a public role (Student Affairs is admin-provisioned).
+      allow create: if signedIn() && userId == uid()
+        && request.resource.data.role in ['student', 'organiser', 'vendor'];
+      // Update own profile but never change role or uid.
+      allow update: if signedIn() && userId == uid()
+        && request.resource.data.role == resource.data.role;
+      allow delete: if false;
+
+      match /notifications/{nid} {
+        allow read: if signedIn() && userId == uid();
+        // Anyone signed in may write a notification to another user (announcements,
+        // order updates, waitlist promotions). Cloud Functions push these to FCM.
+        allow create: if signedIn();
+        allow update: if signedIn() && userId == uid() && onlyChanged(['read']);
+        allow delete: if signedIn() && userId == uid();
+      }
+    }
+
+    // ───────────── proposals ─────────────
+    match /proposals/{proposalId} {
+      allow read: if signedIn() && (resource.data.organiserId == uid() || isStudentAffairs());
+      allow create: if isOrganiser() && request.resource.data.organiserId == uid()
+        && request.resource.data.status in ['draft', 'submitted'];
+      // Organiser edits own proposal while editable; Student Affairs reviews.
+      allow update: if signedIn() && (
+        (resource.data.organiserId == uid() && resource.data.status in ['draft', 'needs_changes', 'approved', 'submitted']
+          && request.resource.data.organiserId == uid())
+        || (isStudentAffairs() && onlyChanged(['status', 'reviewerComment', 'reviewedBy', 'reviewedAt']))
+      );
+      allow delete: if signedIn() && resource.data.organiserId == uid() && resource.data.status == 'draft';
+    }
+
+    // ───────────── events ─────────────
+    match /events/{eventId} {
+      allow read: if signedIn();
+      allow create: if isOrganiser() && request.resource.data.organiserId == uid()
+        && request.resource.data.capacity > 0;
+      // Owner may update anything except ownership.
+      // Students/vendors may only touch counters through transactions
+      // (registration / waitlist / attendance counters).
+      allow update: if signedIn() && (
+        (ownsEvent(eventId) && request.resource.data.organiserId == resource.data.organiserId)
+        || onlyChanged(['registeredCount', 'waitlistCount', 'confirmedCount', 'attendedCount'])
+      );
+      allow delete: if false; // events are cancelled, never deleted
+    }
+
+    // ───────────── registrations ─────────────
+    match /registrations/{regId} {
+      allow read: if signedIn() && (
+        resource.data.studentId == uid()
+        || ownsEvent(resource.data.eventId)
+        || isOrganiser() // crew phones scanning on behalf of the organiser
+      );
+      // Student creates own registration; doc id must be `${eventId}_${uid}`.
+      // Organisers may create walk-ins.
+      allow create: if signedIn() && (
+        (request.resource.data.studentId == uid() && regId == request.resource.data.eventId + '_' + uid()
+          && request.resource.data.status in ['registered', 'waitlisted'])
+        || (isOrganiser() && request.resource.data.isWalkIn == true)
+      );
+      allow update: if signedIn() && (
+        // student: cancel or confirm only
+        (resource.data.studentId == uid()
+          && onlyChanged(['status', 'cancelledAt', 'confirmed', 'confirmedAt', 'waitlistPosition'])
+          && (request.resource.data.status in ['cancelled', resource.data.status]))
+        // organiser crew: check-in, seat rescue, waitlist promotion, removal
+        || isOrganiser()
+        // waitlist promotion triggered by another student's cancellation (transaction)
+        || (isStudent() && resource.data.status == 'waitlisted' && request.resource.data.status == 'registered'
+          && onlyChanged(['status', 'waitlistPosition', 'promotedAt']))
+      );
+      allow delete: if false;
+    }
+
+    // ───────────── products ─────────────
+    match /products/{productId} {
+      allow read: if signedIn();
+      allow create: if isVendor() && request.resource.data.vendorId == uid();
+      allow update: if signedIn() && (
+        (resource.data.vendorId == uid())
+        // students placing orders deduct stock inside a transaction
+        || (isStudent() && onlyChanged(['quantity', 'soldCount']) && request.resource.data.quantity >= 0)
+        // vendors/students cancelling restore stock
+        || onlyChanged(['quantity', 'soldCount'])
+      );
+      allow delete: if signedIn() && resource.data.vendorId == uid();
+    }
+
+    // ───────────── orders ─────────────
+    match /orders/{orderId} {
+      allow read: if signedIn() && (
+        resource.data.studentId == uid()
+        || resource.data.vendorId == uid()
+        || ownsEvent(resource.data.eventId)
+      );
+      allow create: if isStudent() && request.resource.data.studentId == uid()
+        && request.resource.data.status == 'pending' && request.resource.data.total >= 0;
+      allow update: if signedIn() && (
+        // vendor moves status forward / cancels
+        (resource.data.vendorId == uid() && onlyChanged(['status', 'updatedAt', 'cancelledBy']))
+        // student may only cancel while pending
+        || (resource.data.studentId == uid() && resource.data.status == 'pending'
+          && request.resource.data.status == 'cancelled' && onlyChanged(['status', 'updatedAt', 'cancelledBy']))
+      );
+      allow delete: if false;
+    }
+
+    // ───────────── vendorApplications ─────────────
+    match /vendorApplications/{appId} {
+      allow read: if signedIn();
+      allow create: if isVendor() && request.resource.data.vendorId == uid()
+        && appId == request.resource.data.eventId + '_' + uid()
+        && request.resource.data.status == 'pending';
+      allow update: if signedIn() && (
+        (ownsEvent(resource.data.eventId))
+        || (resource.data.vendorId == uid() && onlyChanged(['checkedInAt', 'message']))
+      );
+      allow delete: if signedIn() && resource.data.vendorId == uid() && resource.data.status == 'pending';
+    }
+
+    // ───────────── tasks / budgets / announcements ─────────────
+    match /tasks/{taskId} {
+      allow read: if isOrganiser();
+      allow create: if isOrganiser() && ownsEvent(request.resource.data.eventId);
+      allow update, delete: if isOrganiser() && ownsEvent(resource.data.eventId);
+    }
+
+    match /budgets/{lineId} {
+      allow read: if isOrganiser() && (ownsEvent(resource.data.eventId) || isStudentAffairs());
+      allow create: if isOrganiser() && ownsEvent(request.resource.data.eventId);
+      allow update, delete: if isOrganiser() && ownsEvent(resource.data.eventId);
+    }
+
+    match /announcements/{annId} {
+      allow read: if signedIn();
+      allow create: if isOrganiser() && ownsEvent(request.resource.data.eventId)
+        && request.resource.data.organiserId == uid();
+      allow update, delete: if false;
+    }
+
+    // ───────────── feedback ─────────────
+    match /feedback/{fbId} {
+      allow read: if signedIn() && (
+        resource.data.studentId == uid() || isOrganiser() || isVendor()
+      );
+      allow create, update: if isStudent() && request.resource.data.studentId == uid()
+        && fbId == request.resource.data.eventId + '_' + uid()
+        && request.resource.data.eventRating >= 1 && request.resource.data.eventRating <= 5;
+      allow delete: if false;
+    }
+  }
+}

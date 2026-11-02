@@ -1,0 +1,36 @@
+rules_version = '2';
+
+// Firebase Storage rules for UniEvent images.
+service firebase.storage {
+  match /b/{bucket}/o {
+    function signedIn() { return request.auth != null; }
+    function isImage() {
+      return request.resource.contentType.matches('image/.*')
+        && request.resource.size < 8 * 1024 * 1024;
+    }
+
+    // Profile / business photos: only the owner writes.
+    match /avatars/{uid}/{file} {
+      allow read: if signedIn();
+      allow write: if signedIn() && request.auth.uid == uid && isImage();
+    }
+
+    // Event posters: any organiser may upload (folder keyed by event or uid).
+    match /posters/{folder}/{file} {
+      allow read: if true;
+      allow write: if signedIn() && isImage();
+    }
+
+    // Product photos: vendor's own folder.
+    match /products/{vendorId}/{file} {
+      allow read: if true;
+      allow write: if signedIn() && request.auth.uid == vendorId && isImage();
+    }
+
+    // Budget receipts: organisers only.
+    match /receipts/{eventId}/{file} {
+      allow read: if signedIn();
+      allow write: if signedIn() && isImage();
+    }
+  }
+}
